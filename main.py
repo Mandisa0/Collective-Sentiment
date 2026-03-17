@@ -1,113 +1,184 @@
 import requests
-import pandas as pd
+import sqlite3
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 
 # =========================
 # CONFIG
 # =========================
-SUBREDDIT = "all"
-TOTAL_POSTS = 10000        # how many posts you want in total
-BATCH_SIZE = 100          # max per request (Reddit limit ~100)
-COOLDOWN = 30             # seconds between requests
+SUBREDDITS = [
+    "worldnews",
+    "anime_titties",
+    "news",
+    "inthenews",
+   
+    # Africa
+    "Africa",
+    "southafrica",
+   
+    # Europe
+    "europe",
+    "ukpolitics",
+   
+    # Americas
+    "canada",
+    "latinamerica",
+   
+    # Asia / Middle East
+    "asia",
+    "india",
+    "china",
+    "japan",
+    "MiddleEast",
+   
+    # Global politics / geopolitics
+    "geopolitics",
+    "worldpolitics"
+]
+TOTAL_POSTS = 1000
+BATCH_SIZE = 100
+COOLDOWN = 30
 
-OUTPUT_FILE = "reddit_sentiment_loop.csv"
+DB_FILE = "reddit.db"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (sentiment loop script)"
+    "User-Agent": "Mozilla/5.0 (sentiment pipeline)"
 }
+
+# =========================
+# DB SETUP
+# =========================
+conn = sqlite3.connect(DB_FILE)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS posts (
+    id TEXT PRIMARY KEY,
+    subreddit TEXT,
+    title TEXT,
+    score INTEGER,
+    created_utc TEXT,
+    text TEXT,
+    sentiment REAL,
+    positive REAL,
+    neutral REAL,
+    negative REAL
+)
+""")
+
+conn.commit()
 
 # =========================
 # INIT
 # =========================
 analyzer = SentimentIntensityAnalyzer()
-posts_data = []
-
-after = None
 fetched = 0
 
-print(f"Target: {TOTAL_POSTS} posts from r/{SUBREDDIT}")
+print(f"Target new posts: {TOTAL_POSTS}")
 
 # =========================
-# LOOP
+# MAIN LOOP
 # =========================
-while fetched < TOTAL_POSTS:
-    url = f"https://www.reddit.com/r/{SUBREDDIT}/hot.json?limit={BATCH_SIZE}"
-    
-    if after:
-        url += f"&after={after}"
+for subreddit in SUBREDDITS:
+    print(f"\n--- Processing r/{subreddit} ---")
 
-    print(f"\nFetching batch... (current total: {fetched})")
+    after = None
 
-    response = requests.get(url, headers=HEADERS)
+    while fetched < TOTAL_POSTS:
+        url = f"https://www.reddit.com/r/{subreddit}/new.json?limit={BATCH_SIZE}"
 
-    if response.status_code != 200:
-        print(f"Error: {response.status_code}")
-        print("Stopping early to avoid ban.")
-        break
+        if after:
+            url += f"&after={after}"
 
-    data = response.json()
+        print(f"Fetching batch... (current new: {fetched})")
 
-    posts = data["data"]["children"]
-    after = data["data"]["after"]
+        response = requests.get(url, headers=HEADERS)
 
-    if not posts:
-        print("No more posts available.")
-        break
-
-    for item in posts:
-        if fetched >= TOTAL_POSTS:
+        if response.status_code != 200:
+            print(f"Error {response.status_code} on r/{subreddit}")
             break
 
-        post = item["data"]
-        text = f"{post.get('title', '')} {post.get('selftext', '')}"
+        data = response.json()
+        posts = data["data"]["children"]
+        after = data["data"]["after"]
 
-        sentiment = analyzer.polarity_scores(text)
+        if not posts:
+            print("No more posts.")
+            break
 
-        posts_data.append({
-            "title": post.get("title"),
-            "score": post.get("score"),
-            "created_utc": datetime.utcfromtimestamp(post.get("created_utc")),
-            "text": text,
-            "sentiment": sentiment["compound"],
-            "positive": sentiment["pos"],
-            "neutral": sentiment["neu"],
-            "negative": sentiment["neg"]
-        })
+        new_posts_in_batch = 0
 
-        fetched += 1
+        for item in posts:
+            if fetched >= TOTAL_POSTS:
+                break
 
-    print(f"Fetched so far: {fetched}")
+            post = item["data"]
+            post_id = str(post.get("id"))
 
-    if not after:
-        print("Reached end of listing.")
-        break
+            text = f"{post.get('title', '')} {post.get('selftext', '')}"
 
-    if fetched < TOTAL_POSTS:
-        print(f"Sleeping for {COOLDOWN} seconds...")
-        time.sleep(COOLDOWN)
+            sentiment = analyzer.polarity_scores(text)
+
+            try:
+                cursor.execute("""
+                INSERT INTO posts (
+                    id, subreddit, title, score, created_utc, text,
+                    sentiment, positive, neutral, negative
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    post_id,
+                    subreddit,
+                    post.get("title"),
+                    post.get("score"),
+                    datetime.fromtimestamp(
+                        post.get("created_utc"), tz=timezone.utc
+                    ).isoformat(),
+                    text,
+                    sentiment["compound"],
+                    sentiment["pos"],
+                    sentiment["neu"],
+                    sentiment["neg"]
+                ))
+
+                conn.commit()
+
+                fetched += 1
+                new_posts_in_batch += 1
+
+            except sqlite3.IntegrityError:
+                # Duplicate (PRIMARY KEY hit)
+                continue
+
+        print(f"New in batch: {new_posts_in_batch} | Total new: {fetched}")
+
+        # =========================
+        # EARLY EXIT
+        # =========================
+        if new_posts_in_batch == 0:
+            print("No new posts in this batch. Moving to next subreddit.")
+            break
+
+        if not after:
+            print("End of pagination.")
+            break
+
+        if fetched < TOTAL_POSTS:
+            print(f"Sleeping {COOLDOWN}s...")
+            time.sleep(COOLDOWN)
 
 # =========================
-# SAVE
+# SUMMARY QUERY
 # =========================
-df = pd.DataFrame(posts_data)
-df.to_csv(OUTPUT_FILE, index=False)
+print("\n=== Database Summary ===")
 
-print(f"\nSaved {len(df)} posts to {OUTPUT_FILE}")
+cursor.execute("SELECT COUNT(*) FROM posts")
+total = cursor.fetchone()[0]
 
-# =========================
-# SUMMARY
-# =========================
-if not df.empty:
-    avg_sentiment = df["sentiment"].mean()
+cursor.execute("SELECT AVG(sentiment) FROM posts")
+avg_sentiment = cursor.fetchone()[0]
 
-    positive_pct = (df["sentiment"] > 0.05).mean() * 100
-    neutral_pct = ((df["sentiment"] >= -0.05) & (df["sentiment"] <= 0.05)).mean() * 100
-    negative_pct = (df["sentiment"] < -0.05).mean() * 100
+print(f"Total stored posts: {total}")
+print(f"Average sentiment: {avg_sentiment:.4f}")
 
-    print("\n=== Sentiment Summary ===")
-    print(f"Average Sentiment: {avg_sentiment:.4f}")
-    print(f"Positive: {positive_pct:.2f}%")
-    print(f"Neutral: {neutral_pct:.2f}%")
-    print(f"Negative: {negative_pct:.2f}%")
+conn.close()
